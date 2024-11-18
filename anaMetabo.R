@@ -3,6 +3,48 @@ library(shiny)
 library(shinydashboard)
 library(KEGGREST)
 library(visNetwork)
+library(xml2)
+library(dplyr)
+library(DT)
+
+# Fonction pour charger et traiter le fichier SBML
+load_sbml_data <- function(sbml_file) {
+  doc <- read_xml(sbml_file)
+  ns <- xml_ns_rename(xml_ns(doc), d1 = "sbml")
+  
+  # Extraire les métabolites (nœuds)
+  species_nodes <- xml_find_all(doc, ".//sbml:listOfSpecies/sbml:species", ns)
+  nodes <- data.frame(
+    id = xml_attr(species_nodes, "id"),
+    label = xml_attr(species_nodes, "name"),
+    stringsAsFactors = FALSE
+  )
+  
+  # Extraire les réactions (arêtes)
+  reaction_nodes <- xml_find_all(doc, ".//sbml:listOfReactions/sbml:reaction", ns)
+  edges <- data.frame()
+  
+  for (reaction in reaction_nodes) {
+    reaction_id <- xml_attr(reaction, "id")
+    reaction_name <- xml_attr(reaction, "name")
+    
+    # Réactifs et produits
+    reactants <- xml_find_all(reaction, ".//sbml:listOfReactants/sbml:speciesReference", ns)
+    products <- xml_find_all(reaction, ".//sbml:listOfProducts/sbml:speciesReference", ns)
+    
+    reactant_ids <- xml_attr(reactants, "species")
+    product_ids <- xml_attr(products, "species")
+    
+    # Créer des liens pour chaque combinaison réactif-produit
+    for (reactant in reactant_ids) {
+      for (product in product_ids) {
+        edges <- rbind(edges, data.frame(from = reactant, to = product, label = reaction_name, stringsAsFactors = FALSE))
+      }
+    }
+  }
+  
+  list(nodes = nodes, edges = edges)
+}
 
 # Interface utilisateur de l'application
 ui <- dashboardPage(
@@ -26,53 +68,44 @@ ui <- dashboardPage(
       tabItem(tabName = "home",
               h2("Bienvenue dans l'application AnaMetabo"),
               p("Un outil pour visualiser et effectuer des analyses qualitatives des pathways du virus H5N1."),
-              # Contenu principal de la page d'accueil
-              tags$div(style = "flex: 1"),
               tags$footer(
                 p("Créé par Céline Hosteins, Linda Khodja, Franck Sanchez, Maroa Alani, Ilham Bedraoui"),
                 style = "position: fixed; bottom: 0; width: 100%; text-align: center; background-color: #f8f9fa; padding: 10px; font-size: 12px; color: #555;"
               )
       ),
       
-      # Onglet Importation des Pathways
-      tabItem(tabName = "import_pathway",
-              fluidRow(
-                box(width = 4,
-                    title = "Importer un Pathway", status = "primary",
-                    selectInput("pathway_id", "Choisir un Pathway KEGG:", choices = c("hsa05164"), selected = "hsa05164"),
-                    actionButton("import_kegg", "Importer le Pathway depuis KEGG")
-                ),
-                box(width = 8,
-                    title = "Aperçu du Pathway", status = "info",
-                    verbatimTextOutput("xml_preview")
-                )
-              )
-      ),
-      
       # Onglet Visualisation de Réseaux
       tabItem(tabName = "visualisation",
               fluidRow(
-                box(width = 12,
-                    title = "Visualisation du Pathway", status = "info",
-                    visNetworkOutput("network", height = "600px")
-                )
-              )
-      ),
-      
-      # Onglet Analyse Qualitative
-      tabItem(tabName = "qualitative_analysis",
-              h2("Analyse Qualitative du Pathway"),
-              fluidRow(
-                box(width = 4, 
-                    title = "Options d'Annotation", status = "primary",
-                    textInput("node_annotation", "Annoter un nœud (ID):", ""),
-                    textAreaInput("annotation_text", "Texte de l'annotation:", "", rows = 3),
-                    actionButton("add_annotation", "Ajouter l'annotation")
+                box(width = 4,
+                    title = "Charger le graphe",
+                    status = "primary",
+                    h4("Depuis un fichier SBML"),
+                    fileInput("sbmlFile", "Sélectionner un fichier SBML", accept = c(".sbml", ".xml")),
+                    actionButton("loadGraphFromSBML", "Charger depuis SBML"),
+                    hr(),
+                    h4("Depuis des fichiers CSV"),
+                    fileInput("nodesCSV", "Fichier des nœuds (nodes.csv)", accept = ".csv"),
+                    fileInput("edgesCSV", "Fichier des arêtes (edges.csv)", accept = ".csv"),
+                    actionButton("loadGraphFromCSV", "Charger depuis CSV"),
+                    hr(),
+                    actionButton("saveGraph", "Sauvegarder le graphe")
                 ),
                 box(width = 8,
-                    title = "Annotations", status = "info",
-                    tableOutput("annotation_table")
+                    title = "Visualisation du Réseau",
+                    status = "info",
+                    visNetworkOutput("network", height = "600px"),
+                    textOutput("graph_stats"),
+                    hr(),
+                    actionButton("addNode", "Ajouter un nœud"),
+                    actionButton("deleteNode", "Supprimer un nœud sélectionné"),
+                    actionButton("addEdge", "Ajouter une arête"),
+                    actionButton("deleteEdge", "Supprimer une arête sélectionnée")
                 )
+              ),
+              fluidRow(
+                box(width = 6, title = "Table des Nœuds", status = "info", DTOutput("nodes_table")),
+                box(width = 6, title = "Table des Arêtes", status = "info", DTOutput("edges_table"))
               )
       )
     )
@@ -81,54 +114,60 @@ ui <- dashboardPage(
 
 # Serveur de l'application
 server <- function(input, output, session) {
-  # Stocker les annotations
-  annotations <- reactiveVal(data.frame(Node = character(), Annotation = character(), stringsAsFactors = FALSE))
   
-  # Importer et afficher un aperçu du fichier XML depuis KEGG
-  observeEvent(input$import_kegg, {
-    req(input$pathway_id)
-    pathway_id <- input$pathway_id
-    kgml_url <- paste0("https://rest.kegg.jp/get/", pathway_id, "/kgml")
-    kgml_file <- tempfile(fileext = ".xml")
-    download.file(kgml_url, destfile = kgml_file, mode = "wb")
-    xml_content <- readLines(kgml_file, n = 10)  # Lire les 10 premières lignes pour un aperçu
-    output$xml_preview <- renderPrint({
-      xml_content
+  # Réactif pour stocker les données du graphe
+  graph_data <- reactiveVal(list(nodes = data.frame(id = character(), label = character(), stringsAsFactors = FALSE),
+                                 edges = data.frame(from = character(), to = character(), label = character(), stringsAsFactors = FALSE)))
+  
+  # Fonction pour mettre à jour les statistiques du graphe
+  update_graph_stats <- function(nodes, edges) {
+    paste("Nombre de nœuds :", nrow(nodes), "| Nombre d'arêtes :", nrow(edges))
+  }
+  
+  # Charger un fichier SBML
+  observeEvent(input$loadGraphFromSBML, {
+    req(input$sbmlFile)
+    sbml_data <- load_sbml_data(input$sbmlFile$datapath)
+    graph_data(sbml_data)
+    output$graph_stats <- renderText({
+      update_graph_stats(sbml_data$nodes, sbml_data$edges)
     })
-  })
-  
-  # Visualisation du pathway avec visNetwork
-  observeEvent(input$import_kegg, {
-    req(input$pathway_id)
-    pathway_id <- input$pathway_id
-    kgml_url <- paste0("https://rest.kegg.jp/get/", pathway_id, "/kgml")
-    kgml_file <- tempfile(fileext = ".xml")
-    download.file(kgml_url, destfile = kgml_file, mode = "wb")
-    
-    # Parser le fichier XML pour extraire les nœuds et les arêtes (simplification)
-    nodes <- data.frame(id = 1:5, label = paste("Nœud", 1:5))  # Exemple de nœuds
-    edges <- data.frame(from = c(1, 2, 3), to = c(2, 3, 4))  # Exemple d'arêtes
-    
     output$network <- renderVisNetwork({
-      visNetwork(nodes, edges) %>%
-        visNodes(shape = "dot", size = 15) %>%
+      visNetwork(sbml_data$nodes, sbml_data$edges) %>%
         visEdges(arrows = "to") %>%
+        visNodes(color = list(border = "black", background = "#97C2FC")) %>%
+        visLayout(randomSeed = 42) %>%
+        visInteraction(navigationButtons = TRUE) %>%
         visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE)
     })
   })
   
-  # Ajouter des annotations
-  observeEvent(input$add_annotation, {
-    req(input$node_annotation, input$annotation_text)
-    new_annotation <- data.frame(Node = input$node_annotation, Annotation = input$annotation_text, stringsAsFactors = FALSE)
-    annotations(rbind(annotations(), new_annotation))
+  # Charger depuis des fichiers CSV
+  observeEvent(input$loadGraphFromCSV, {
+    req(input$nodesCSV, input$edgesCSV)
+    nodes_data <- read.csv(input$nodesCSV$datapath, stringsAsFactors = FALSE)
+    edges_data <- read.csv(input$edgesCSV$datapath, stringsAsFactors = FALSE)
+    graph_data(list(nodes = nodes_data, edges = edges_data))
+    output$graph_stats <- renderText({
+      update_graph_stats(nodes_data, edges_data)
+    })
+    output$network <- renderVisNetwork({
+      visNetwork(nodes_data, edges_data) %>%
+        visEdges(arrows = "to") %>%
+        visNodes(color = list(border = "black", background = "#97C2FC")) %>%
+        visLayout(randomSeed = 42) %>%
+        visInteraction(navigationButtons = TRUE, nodesIdSelection = TRUE)
+    })
   })
   
-  # Afficher les annotations
-  output$annotation_table <- renderTable({
-    annotations()
+  # Affichage des tables
+  output$nodes_table <- renderDT({
+    datatable(graph_data()$nodes, options = list(pageLength = 10), selection = "single")
+  })
+  output$edges_table <- renderDT({
+    datatable(graph_data()$edges, options = list(pageLength = 10), selection = "single")
   })
 }
 
-# Créer l'application Shiny
+# Lancer l'application
 shinyApp(ui, server)
